@@ -7,6 +7,7 @@
 from __future__ import annotations
 import os
 import sys
+import hashlib
 import pathlib
 import shutil
 import logging
@@ -982,6 +983,42 @@ class FileManager:
             if dir_path:
                 filename = os.path.join(dir_path, filename)
             dest_path = os.path.abspath(os.path.join(root_path, filename))
+        # Truncate basename if it exceeds Linux filesystem limits.
+        # Windows allows longer filenames than ext4; clients may send
+        # filenames that exceed NAME_MAX (255 bytes) or PATH_MAX (4096
+        # bytes). Reserve bytes for:
+        #   32 bytes — metadata suffixes (.thumbs/{stem}-{W}x{H}.png etc.)
+        #    9 bytes — hash suffix (_a1b2c3d4) to prevent collision when
+        #              two long filenames differ only in the tail.
+        METADATA_RESERVE = 32
+        HASH_LEN = 9  # "_" + 8 hex chars
+        dest_dir = os.path.dirname(dest_path)
+        dest_stem, dest_ext = os.path.splitext(os.path.basename(dest_path))
+        ext_len = len(dest_ext.encode())
+        # Available bytes for the basename is constrained by both
+        # NAME_MAX (255 per component) and PATH_MAX (4096 full path).
+        max_basename = min(255, 4096 - len(dest_dir.encode()) - 1)
+        max_stem_bytes = max_basename - ext_len - METADATA_RESERVE
+        stem_bytes = dest_stem.encode()
+        if len(stem_bytes) > max_stem_bytes:
+            hash_suffix = f"_{hashlib.sha256(stem_bytes).hexdigest()[:8]}"
+            truncated = stem_bytes[:max_stem_bytes - HASH_LEN].decode(
+                'utf-8', errors='ignore'
+            )
+            # Drop trailing incomplete multi-byte sequence
+            while len(truncated.encode()) > max_stem_bytes - HASH_LEN:
+                truncated = truncated[:-1]
+            new_basename = f"{truncated}{hash_suffix}{dest_ext}"
+            dest_path = os.path.join(dest_dir, new_basename)
+            # Update filename to match so it's consistent downstream
+            if dir_path:
+                filename = os.path.join(dir_path, new_basename)
+            else:
+                filename = new_basename
+            logging.info(
+                f"Filename truncated to {len(new_basename.encode())} bytes: "
+                f"{new_basename}"
+            )
         # Validate the path.  Don't allow uploads to a parent of the root
         if not dest_path.startswith(root_path):
             raise self.server.error(
@@ -1092,6 +1129,10 @@ class FileManager:
                     upload_info['tmp_file_path'], dest_path)
                 finfo = self.get_path_info(upload_info['dest_path'],
                                            upload_info['root'])
+        except OSError as e:
+            logging.exception("Upload Write Error")
+            raise self.server.error(
+                f"Unable to save file: {e.strerror or str(e)}", 500)
         except Exception:
             logging.exception("Upload Write Error")
             raise self.server.error("Unable to save file", 500)

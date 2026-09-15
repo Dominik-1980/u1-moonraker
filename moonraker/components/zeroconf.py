@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 
 ZC_SERVICE_TYPE = "_snapmaker._tcp.local."
 LAN_MQTT_PORT = 1884
+SN_WATCH_INTERVAL = 10.0
 
 class AsyncRunner:
     def __init__(self, ip_version: IPVersion) -> None:
@@ -83,6 +84,9 @@ class ZeroconfRegistrar:
         self.runner = AsyncRunner(self.ip_version)
         self.cfg_addr = addr
         self.bound_all = addr in ["0.0.0.0", "::"]
+        self.lock = asyncio.Lock()
+        self._sn_path: Optional[pathlib.Path] = None
+        self._sn_watcher_task: Optional[asyncio.Task] = None
         if self.bound_all:
             self.server.register_event_handler(
                 "machine:net_state_changed", self._update_service)
@@ -99,6 +103,7 @@ class ZeroconfRegistrar:
         client_mgr: ClientManager = self.server.lookup_component("client_manager")
         app_args = self.server.get_app_args()
         instance_uuid: str = app_args["instance_uuid"]
+        self._sn_path = pathlib.Path(app_args["data_path"]).joinpath(".lava.sn")
         if (
             machine.get_provider_type().startswith("systemd") and
             "unit_name" in machine.get_moonraker_service_info()
@@ -178,6 +183,27 @@ class ZeroconfRegistrar:
             await self.ssdp_server.start()
             self.ssdp_server.register_service(name, addr, hi["port"])
         self.server.register_event_handler("snapmaker:update_mdns_info", self._update_properties)
+        self._sn_watcher_task = asyncio.create_task(self._sn_watcher_loop())
+
+    async def _sn_watcher_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(SN_WATCH_INTERVAL)
+                if self._sn_path is None or not self._sn_path.exists():
+                    continue
+                try:
+                    new_sn = self._sn_path.read_text().strip()
+                except OSError:
+                    logging.exception(f"zeroconf: failed to read SN file {self._sn_path}")
+                    continue
+                if not new_sn or new_sn == self.zc_service_props.get("sn", ""):
+                    continue
+                logging.info(f"zeroconf: SN changed -> '{new_sn}', updating mDNS")
+                await self._update_properties({"sn": new_sn})
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logging.exception("zeroconf: SN watcher loop error")
 
     async def _update_properties(self, properties: dict) -> None:
         need_update = False
@@ -190,46 +216,75 @@ class ZeroconfRegistrar:
                 self.zc_service_props[k] = v
                 need_update = True
 
-        if need_update:
-            if self.bound_all:
-                logging.info('update zc service: {}'.format(self.zc_service_props))
+        if not need_update or not self.bound_all:
+            return
+        async with self.lock:
+            logging.info('update zc service: {}'.format(self.zc_service_props))
+            # Unregister the old service_info, then register a fresh one.
+            # update_services alone doesn't reliably push new TXT records
+            # (python-zeroconf caches the encoding), and skipping unregister
+            # leaves phantom instances broadcasting stale properties.
+            try:
                 await self.runner.unregister_services([self.service_info])
-                self.service_info = AsyncServiceInfo(
-                    ZC_SERVICE_TYPE,
-                    self.zc_service_name,
-                    addresses=self.addresses,
-                    port=LAN_MQTT_PORT,
-                    properties=self.zc_service_props,
-                    server=f"U1-{self.zc_service_props['sn']}.local.",
-                )
+            except Exception:
+                logging.exception("zeroconf: failed to unregister old service")
+            self.service_info = AsyncServiceInfo(
+                ZC_SERVICE_TYPE,
+                self.zc_service_name,
+                addresses=self.addresses,
+                port=LAN_MQTT_PORT,
+                properties=self.zc_service_props,
+                server=f"U1-{self.zc_service_props['sn']}.local.",
+            )
+            try:
                 await self.runner.register_services([self.service_info])
+            except Exception:
+                logging.exception("zeroconf: failed to register new service")
 
     async def close(self) -> None:
-        await self.runner.unregister_services([self.service_info])
+        if self._sn_watcher_task is not None:
+            self._sn_watcher_task.cancel()
+            try:
+                await self._sn_watcher_task
+            except asyncio.CancelledError:
+                pass
+            self._sn_watcher_task = None
+        async with self.lock:
+            await self.runner.unregister_services([self.service_info])
         if self.ssdp_server is not None:
             await self.ssdp_server.stop()
 
     async def _update_service(self, network: Dict[str, Any]) -> None:
-        if self.bound_all:
-            await self.runner.unregister_services([self.service_info])
+        if not self.bound_all:
+            return
+        async with self.lock:
             addresses = [x for x in self._extract_ip_addresses(network)]
+            if addresses == self.addresses:
+                return
+            logging.info("zeroconf: addresses changed, updating service")
+            try:
+                await self.runner.unregister_services([self.service_info])
+            except Exception:
+                logging.exception("zeroconf: failed to unregister old service")
+            self.addresses = addresses
             for addr_bytes in addresses:
                 try:
                     ip_addr = ipaddress.ip_address(addr_bytes)
                     self.zc_service_props["ip"] = str(ip_addr)
                 except ValueError:
                     pass
-            self.addresses = addresses
             self.service_info = AsyncServiceInfo(
-                    ZC_SERVICE_TYPE,
-                    self.zc_service_name,
-                    addresses=self.addresses,
-                    port=LAN_MQTT_PORT,
-                    properties=self.zc_service_props,
-                    server=f"U1-{self.zc_service_props['sn']}.local.",
+                ZC_SERVICE_TYPE,
+                self.zc_service_name,
+                addresses=addresses,
+                port=LAN_MQTT_PORT,
+                properties=self.zc_service_props,
+                server=f"U1-{self.zc_service_props['sn']}.local.",
             )
-            logging.info("update zeroconf, new props:{}".format(self.zc_service_props))
-            await self.runner.register_services([self.service_info])
+            try:
+                await self.runner.register_services([self.service_info])
+            except Exception:
+                logging.exception("zeroconf: failed to register service with new addresses")
 
     def _extract_ip_addresses(self, network: Dict[str, Any]) -> Iterator[bytes]:
         for ifname, ifinfo in network.items():

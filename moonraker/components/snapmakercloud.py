@@ -821,6 +821,13 @@ class PrintHandler:
             self.download_progress = -1
             self.download_time = 0.0
             self.download_task = None
+            if self.download_state != "idle":
+                # Task crashed before calling _reset_download_state (e.g.
+                # unhandled exception in the download coroutine) - reset here
+                # to prevent download_state from being stuck forever.
+                logging.warning(
+                    f"download task exited with state '{self.download_state}', resetting")
+                self.eventloop.create_task(self._reset_download_state())
             return eventtime + self.CHECK_INTERVAL * 2
         return eventtime + self.CHECK_INTERVAL
 
@@ -926,7 +933,7 @@ class PrintHandler:
         accept = "text/plain,applicaton/octet-stream"
 
         auth_url = await self._authorize_download_url(url)
-        if len(auth_url) < 10:
+        if not auth_url or len(auth_url) < 10:
             state = "error"
             message = f"invalid URL: {auth_url}"
             self._notify_download_state(state, message)
@@ -1075,6 +1082,10 @@ class PrintHandler:
                     continue
 
                 obj: Dict[str, Any] = jsonw.loads(resp)
+                if obj.get('error', None) is not None:
+                    logging.error(f"authorize URL error response: {obj.get('error')}")
+                    return ""
+
                 if obj.get('result', None) is None:
                     await asyncio.sleep(1)
                     continue
@@ -1096,6 +1107,8 @@ class PrintHandler:
                 resp = None
                 logging.error(f"authorize URL exception: {e}, resp: {resp}")
                 continue
+        logging.error(f"authorize URL failed after retries: {url}")
+        return ""
 
     def _cleanup_3mf_temp_files(self, tmpdir_path: pathlib.Path, plates: List, plates_md5: List, top_thumbs: List) -> None:
         all_files = plates + plates_md5 + top_thumbs
@@ -1325,7 +1338,7 @@ class PrintHandler:
         filename = pathlib.PurePath(dist_file.name)
         accept = "text/plain,applicaton/octet-stream"
         auth_url = await self._authorize_download_url(url)
-        if len(auth_url) < 10:
+        if not auth_url or len(auth_url) < 10:
             state = "error"
             message = f"invalid URL: {auth_url}"
             self._notify_download_state(state, message)
@@ -1686,7 +1699,10 @@ class PrintHandler:
             return False
         kapi: KlippyAPI = self.server.lookup_component("klippy_apis")
         try:
-            result = await kapi.query_objects({"print_stats": None})
+            result = await kapi.query_objects({
+                "print_stats": None,
+                "machine_state_manager": None
+            })
         except Exception:
             # Klippy not connected
             logging.error("Failed to query print_stats from klippy")
@@ -1697,6 +1713,23 @@ class PrintHandler:
         state: str = result['print_stats']['state']
         if state in ["printing", "paused"]:
             logging.warning("Printer is busy, cannot start new print")
+            return False
+        msm = result.get('machine_state_manager')
+        if msm is None:
+            logging.error("No machine_state_manager in klippy response, cannot start print")
+            return False
+        # MachineMainState.IDLE == 0, printing is only allowed to start from IDLE
+        main_state = msm.get('main_state', -1)
+        if main_state == "IDLE":
+            main_state = 0
+        try:
+            main_state = int(main_state)
+        except (TypeError, ValueError):
+            logging.error(f"Invalid machine main_state: {msm.get('main_state')}")
+            return False
+        if main_state != 0:
+            logging.warning(
+                f"Machine main_state={msm.get('main_state')} is not IDLE, cannot start print")
             return False
         return True
 

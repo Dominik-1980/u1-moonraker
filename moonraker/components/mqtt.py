@@ -401,9 +401,12 @@ class MQTTClient(APITransport):
         # Subscribe to API requests
         self.api_request_topic = f"{self.instance_name}/request"
         self.api_resp_topic = f"{self.instance_name}/response"
-        self.klipper_status_topic = f"{self.instance_name}/status"
-        self.klipper_state_prefix = f"{self.instance_name}/klipper/state"
-        self.moonraker_status_topic = f"{self.instance_name}/notification"
+        # Cloud-facing topics are owned by unisrv; moonraker only publishes to
+        # its own namespace. unisrv bridges these onto <sn>/status and
+        # <sn>/notification for cloud forwarding.
+        self.klipper_status_topic = "moonraker/status"
+        self.klipper_state_prefix = "moonraker/klipper/state"
+        self.moonraker_status_topic = "moonraker/notification"
         self.camera_notification_topic = "camera/notification"
         self.system_notification_topic = "system/notification"
         self.internal_request_topic = f"moonraker/request"
@@ -811,6 +814,10 @@ class MQTTClient(APITransport):
                                      self.api_qos)
     async def _process_internal_request(self, payload: bytes) -> None:
         rpc: JsonRPC = self.server.lookup_component("jsonrpc")
+        self.last_request_time = self.eventloop.get_loop_time()
+        if not self.client_online:
+            logging.info("MQTT Client Online!")
+            self.client_online = True
         response = await rpc.dispatch(payload, self)
         if response is not None:
             await self.publish_topic(self.internal_response_topic, response,
@@ -820,8 +827,9 @@ class MQTTClient(APITransport):
         return TransportType.MQTT
 
     async def _forward_internal_notification(self, payload: bytes) -> None:
+        # Notifications reach the cloud directly from unisrv via
+        # <sn>/notification; moonraker only broadcasts them to websocket clients.
         self.server.forward_notification(payload)
-        await self.publish_topic(self.moonraker_status_topic, payload, self.qos, retain=False)
 
     def screen_rpc_request(
         self, api_def: APIDefinition, req_type: RequestType, args: Dict[str, Any]
